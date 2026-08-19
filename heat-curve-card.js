@@ -120,7 +120,7 @@ class HeatCurveCard extends HTMLElement {
     const style = document.createElement("style");
     style.textContent = `
       :host { display: block; }
-      ha-card { padding: 12px 8px 8px; }
+      ha-card { padding: 12px 8px 8px; max-width: 700px; margin: 0 auto; }
       .title { font-size: 1.1em; font-weight: 500; padding: 0 8px 8px; }
       .tabs { display: flex; gap: 4px; padding: 0 8px 8px; }
       .tabs button {
@@ -131,16 +131,19 @@ class HeatCurveCard extends HTMLElement {
       .tabs button.active {
         background: var(--primary-color, #03a9f4); color: var(--text-primary-color, #fff);
       }
-      /* pan-y (not none): lets a touch that starts on empty chart background still scroll the
-         page vertically. A touch that starts on a point (.pt) calls preventDefault() on its own
-         pointerdown, which overrides this and suppresses the scroll for that gesture -- so
-         dragging a point still works, it's only the rest of the chart that stays scrollable. */
+      /* pan-y on the chart as a whole: a touch starting on empty background (gridlines, labels,
+         legend) scrolls the page normally. But touch-action is computed per the touched element,
+         not just the nearest ancestor that sets it -- pan-y on the svg would still let the
+         browser claim a vertical drag that starts ON a point too (dragging IS a vertical
+         gesture), racing our own drag handling and usually winning before preventDefault() is
+         even consulted. Points get their own touch-action: none to opt out of that entirely, so
+         a touch on a dot is unambiguously drag-only and everything else stays scrollable. */
       svg { display: block; width: 100%; height: auto; touch-action: pan-y; }
       .grid line { stroke: var(--divider-color, #e0e0e0); stroke-width: 1; }
       .grid line.major { stroke: var(--secondary-text-color, #bbb); }
       .axis text { fill: var(--secondary-text-color, #888); font-size: 9px; }
       .axis text.major { font-size: 10px; font-weight: 600; }
-      .pt { cursor: grab; }
+      .pt { cursor: grab; touch-action: none; }
       .pt:active { cursor: grabbing; }
       .legend text { fill: var(--primary-text-color, #333); font-size: 11px; }
       .drag-tooltip text { fill: #fff; font-size: 12px; font-weight: 600; }
