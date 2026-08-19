@@ -1,0 +1,329 @@
+// Heat Curve Card — drag-editable multi-line schedule chart for Home Assistant.
+//
+// Renders an arbitrary number of lines (each backed by a series of `input_number` entities,
+// one per hour) on a single SVG chart. Any point can be dragged up/down to change that hour's
+// value. Two lines can be declared as a min/max pair with a minimum required gap, enforced live
+// while dragging so they can never cross or touch.
+//
+// Config:
+//   type: custom:heat-curve-card
+//   title: Hobby Room — Heat Curve
+//   hours: [8, 9, 10, ... 21]        # which hours to plot, in order
+//   y_range: [16, 26]                # fixed y-axis range
+//   step: 0.5                        # value snap step (should match the input_number's own step)
+//   lines:
+//     - id: heat_min
+//       entity_prefix: input_number.hobby_room_heat_min_   # + zero-padded hour -> entity_id
+//       color: "#2980b9"
+//       label: Heat Min
+//       role: min                    # 'min' or 'max' — only needed if `pair` is set
+//       pair: heat_max               # id of the paired line, optional
+//       min_gap: 0.5                 # minimum allowed distance from the paired line
+//     - id: heat_max
+//       entity_prefix: input_number.hobby_room_heat_max_
+//       color: "#e74c3c"
+//       label: Heat Max
+//       role: max
+//       pair: heat_min
+//       min_gap: 0.5
+
+const NS = "http://www.w3.org/2000/svg";
+const SEND_THROTTLE_MS = 150;
+
+function svgEl(tag, attrs) {
+  const el = document.createElementNS(NS, tag);
+  for (const k in attrs) el.setAttribute(k, attrs[k]);
+  return el;
+}
+
+class HeatCurveCard extends HTMLElement {
+  setConfig(config) {
+    if (!config.hours || !config.hours.length) throw new Error("heat-curve-card: `hours` is required");
+    if (!config.lines || !config.lines.length) throw new Error("heat-curve-card: `lines` is required");
+    this._config = {
+      y_range: [16, 26],
+      step: 0.5,
+      width: 500,
+      height: 220,
+      ...config,
+    };
+    this._dragging = null; // { lineId, hour, entityId, pointerId }
+    this._localValues = {}; // entity_id -> value while drag hasn't been confirmed by hass yet
+    this._lastSent = {}; // entity_id -> { value, ts }
+    this._built = false;
+    this._buildDom();
+  }
+
+  set hass(hass) {
+    this._hass = hass;
+    if (!this._built) return;
+    this._syncFromHass();
+  }
+
+  getCardSize() {
+    return 3;
+  }
+
+  // ---- layout helpers ----
+
+  _padding() {
+    return { top: 16, right: 16, bottom: 28, left: 34 };
+  }
+
+  _plotRect() {
+    const { width, height } = this._config;
+    const p = this._padding();
+    return { x: p.left, y: p.top, w: width - p.left - p.right, h: height - p.top - p.bottom };
+  }
+
+  _xScale(hour) {
+    const hours = this._config.hours;
+    const r = this._plotRect();
+    const span = hours[hours.length - 1] - hours[0] || 1;
+    return r.x + ((hour - hours[0]) / span) * r.w;
+  }
+
+  _yScale(value) {
+    const [ymin, ymax] = this._config.y_range;
+    const r = this._plotRect();
+    const clamped = Math.max(ymin, Math.min(ymax, value));
+    return r.y + (1 - (clamped - ymin) / (ymax - ymin)) * r.h;
+  }
+
+  _yInverse(pixelY) {
+    const [ymin, ymax] = this._config.y_range;
+    const r = this._plotRect();
+    const frac = 1 - (pixelY - r.y) / r.h;
+    return ymin + frac * (ymax - ymin);
+  }
+
+  _entityId(line, hour) {
+    return `${line.entity_prefix}${String(hour).padStart(2, "0")}`;
+  }
+
+  // ---- DOM construction (once) ----
+
+  _buildDom() {
+    const { width, height, title } = this._config;
+    const shadow = this.attachShadow({ mode: "open" });
+
+    const style = document.createElement("style");
+    style.textContent = `
+      :host { display: block; }
+      ha-card { padding: 12px 8px 8px; }
+      .title { font-size: 1.1em; font-weight: 500; padding: 0 8px 8px; }
+      svg { display: block; width: 100%; height: auto; touch-action: none; }
+      .grid line { stroke: var(--divider-color, #e0e0e0); stroke-width: 1; }
+      .axis text { fill: var(--secondary-text-color, #888); font-size: 10px; }
+      .pt { cursor: grab; }
+      .pt:active { cursor: grabbing; }
+      .legend text { fill: var(--primary-text-color, #333); font-size: 11px; }
+    `;
+    shadow.appendChild(style);
+
+    const card = document.createElement("ha-card");
+    if (title) {
+      const t = document.createElement("div");
+      t.className = "title";
+      t.textContent = title;
+      card.appendChild(t);
+    }
+
+    const svg = svgEl("svg", { viewBox: `0 0 ${width} ${height}` });
+    this._svg = svg;
+    card.appendChild(svg);
+    shadow.appendChild(card);
+
+    this._drawStatic(svg);
+    this._drawLines(svg);
+
+    svg.addEventListener("pointermove", (e) => this._onPointerMove(e));
+    svg.addEventListener("pointerup", (e) => this._onPointerUp(e));
+    svg.addEventListener("pointercancel", (e) => this._onPointerUp(e));
+
+    this._built = true;
+  }
+
+  _drawStatic(svg) {
+    const r = this._plotRect();
+    const [ymin, ymax] = this._config.y_range;
+    const hours = this._config.hours;
+
+    const grid = svgEl("g", { class: "grid" });
+    // horizontal gridlines every 2 degrees
+    for (let v = Math.ceil(ymin / 2) * 2; v <= ymax; v += 2) {
+      const y = this._yScale(v);
+      grid.appendChild(svgEl("line", { x1: r.x, x2: r.x + r.w, y1: y, y2: y }));
+    }
+    svg.appendChild(grid);
+
+    const axis = svgEl("g", { class: "axis" });
+    for (let v = Math.ceil(ymin / 2) * 2; v <= ymax; v += 2) {
+      const y = this._yScale(v);
+      const t = svgEl("text", { x: r.x - 6, y: y + 3, "text-anchor": "end" });
+      t.textContent = v;
+      axis.appendChild(t);
+    }
+    hours.forEach((h) => {
+      const x = this._xScale(h);
+      const t = svgEl("text", { x, y: r.y + r.h + 16, "text-anchor": "middle" });
+      t.textContent = h;
+      axis.appendChild(t);
+    });
+    svg.appendChild(axis);
+
+    const legend = svgEl("g", { class: "legend" });
+    this._config.lines.forEach((line, i) => {
+      const ly = r.y + i * 14;
+      legend.appendChild(svgEl("circle", { cx: r.x + r.w + 6, cy: ly, r: 3, fill: line.color }));
+      const t = svgEl("text", { x: r.x + r.w + 12, y: ly + 3 });
+      t.textContent = line.label || line.id;
+      legend.appendChild(t);
+    });
+    // legend sits outside the main plot width, so widen the viewBox to fit it
+    svg.setAttribute("viewBox", `0 0 ${this._config.width + 60} ${this._config.height}`);
+    svg.appendChild(legend);
+  }
+
+  _drawLines(svg) {
+    this._pathEls = {};
+    this._pointEls = {};
+    this._config.lines.forEach((line) => {
+      const path = svgEl("polyline", { fill: "none", stroke: line.color, "stroke-width": 2 });
+      svg.appendChild(path);
+      this._pathEls[line.id] = path;
+      this._pointEls[line.id] = {};
+      this._config.hours.forEach((hour) => {
+        const entityId = this._entityId(line, hour);
+        const c = svgEl("circle", { r: 6, fill: line.color, class: "pt" });
+        c.dataset.lineId = line.id;
+        c.dataset.hour = hour;
+        c.dataset.entityId = entityId;
+        c.addEventListener("pointerdown", (e) => this._onPointerDown(e, line, hour, entityId));
+        svg.appendChild(c);
+        this._pointEls[line.id][hour] = c;
+      });
+    });
+  }
+
+  // ---- reactive updates from hass ----
+
+  _valueFor(line, hour) {
+    const entityId = this._entityId(line, hour);
+    if (this._dragging && this._dragging.entityId === entityId) {
+      return this._localValues[entityId];
+    }
+    if (entityId in this._localValues) return this._localValues[entityId];
+    const st = this._hass && this._hass.states[entityId];
+    return st ? parseFloat(st.state) : null;
+  }
+
+  _syncFromHass() {
+    this._config.lines.forEach((line) => {
+      const pts = [];
+      this._config.hours.forEach((hour) => {
+        const v = this._valueFor(line, hour);
+        if (v === null || Number.isNaN(v)) return;
+        const x = this._xScale(hour);
+        const y = this._yScale(v);
+        pts.push(`${x},${y}`);
+        const c = this._pointEls[line.id][hour];
+        c.setAttribute("cx", x);
+        c.setAttribute("cy", y);
+      });
+      this._pathEls[line.id].setAttribute("points", pts.join(" "));
+    });
+  }
+
+  // ---- drag handling ----
+
+  _onPointerDown(e, line, hour, entityId) {
+    e.preventDefault();
+    e.target.setPointerCapture(e.pointerId);
+    const st = this._hass.states[entityId];
+    this._dragging = {
+      pointerId: e.pointerId,
+      line,
+      hour,
+      entityId,
+      entMin: st && st.attributes.min !== undefined ? st.attributes.min : this._config.y_range[0],
+      entMax: st && st.attributes.max !== undefined ? st.attributes.max : this._config.y_range[1],
+    };
+    this._localValues[entityId] = parseFloat(st.state);
+  }
+
+  _pairedValue(line, hour) {
+    if (!line.pair) return null;
+    const pairLine = this._config.lines.find((l) => l.id === line.pair);
+    if (!pairLine) return null;
+    return this._valueFor(pairLine, hour);
+  }
+
+  _onPointerMove(e) {
+    const d = this._dragging;
+    if (!d || e.pointerId !== d.pointerId) return;
+    e.preventDefault();
+
+    const rect = this._svg.getBoundingClientRect();
+    const scaleY = this._config.height / rect.height;
+    const svgY = (e.clientY - rect.top) * scaleY;
+    let value = this._yInverse(svgY);
+
+    const step = this._config.step;
+    value = Math.round(value / step) * step;
+    value = Math.max(d.entMin, Math.min(d.entMax, value));
+
+    const pairVal = this._pairedValue(d.line, d.hour);
+    const minGap = d.line.min_gap || 0;
+    if (pairVal !== null && minGap > 0) {
+      if (d.line.role === "min" && value > pairVal - minGap) value = pairVal - minGap;
+      if (d.line.role === "max" && value < pairVal + minGap) value = pairVal + minGap;
+    }
+
+    this._localValues[d.entityId] = value;
+    this._syncFromHass();
+    this._maybeSend(d.entityId, value);
+  }
+
+  _onPointerUp(e) {
+    const d = this._dragging;
+    if (!d || e.pointerId !== d.pointerId) return;
+    const value = this._localValues[d.entityId];
+    this._sendNow(d.entityId, value);
+    this._dragging = null;
+    // keep the local value pinned until hass state actually reflects it, to avoid a visual
+    // snap-back while waiting for the round trip
+    const check = () => {
+      const st = this._hass.states[d.entityId];
+      if (st && parseFloat(st.state) === value) {
+        delete this._localValues[d.entityId];
+        this._syncFromHass();
+      } else {
+        setTimeout(check, 200);
+      }
+    };
+    setTimeout(check, 200);
+  }
+
+  _maybeSend(entityId, value) {
+    const last = this._lastSent[entityId];
+    const now = Date.now();
+    if (last && last.value === value) return;
+    if (last && now - last.ts < SEND_THROTTLE_MS) return;
+    this._sendNow(entityId, value);
+  }
+
+  _sendNow(entityId, value) {
+    this._lastSent[entityId] = { value, ts: Date.now() };
+    this._hass.callService("input_number", "set_value", { entity_id: entityId, value });
+  }
+}
+
+customElements.define("heat-curve-card", HeatCurveCard);
+
+window.customCards = window.customCards || [];
+window.customCards.push({
+  type: "heat-curve-card",
+  name: "Heat Curve Card",
+  description: "Drag-editable multi-line hourly schedule chart with min/max gap enforcement.",
+});
