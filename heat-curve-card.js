@@ -11,6 +11,14 @@
 //   hours: [8, 9, 10, ... 21]        # which hours to plot, in order
 //   y_range: [16, 26]                # fixed y-axis range
 //   step: 0.5                        # value snap step (should match the input_number's own step)
+//   height: 260                      # optional, defaults to 260
+//   tabs:                            # optional — splits `lines` into switchable groups so only
+//                                     # a couple of lines (and their points) are visible/draggable
+//                                     # at once, instead of all of them crowded together
+//     - label: Heat
+//       lines: [heat_min, heat_max]
+//     - label: Cool
+//       lines: [cool_min, cool_max]
 //   lines:
 //     - id: heat_min
 //       entity_prefix: input_number.hobby_room_heat_min_   # + zero-padded hour -> entity_id
@@ -29,6 +37,7 @@
 
 const NS = "http://www.w3.org/2000/svg";
 const SEND_THROTTLE_MS = 150;
+const POINT_RADIUS = 8;
 
 function svgEl(tag, attrs) {
   const el = document.createElementNS(NS, tag);
@@ -44,12 +53,13 @@ class HeatCurveCard extends HTMLElement {
       y_range: [16, 26],
       step: 0.5,
       width: 500,
-      height: 220,
+      height: 260,
       ...config,
     };
     this._dragging = null; // { lineId, hour, entityId, pointerId }
     this._localValues = {}; // entity_id -> value while drag hasn't been confirmed by hass yet
     this._lastSent = {}; // entity_id -> { value, ts }
+    this._activeTab = 0;
     this._built = false;
     this._buildDom();
   }
@@ -112,6 +122,15 @@ class HeatCurveCard extends HTMLElement {
       :host { display: block; }
       ha-card { padding: 12px 8px 8px; }
       .title { font-size: 1.1em; font-weight: 500; padding: 0 8px 8px; }
+      .tabs { display: flex; gap: 4px; padding: 0 8px 8px; }
+      .tabs button {
+        flex: 1; border: none; border-radius: 8px; padding: 6px 10px; font-size: 0.9em;
+        background: var(--secondary-background-color, #eee); color: var(--primary-text-color, #333);
+        cursor: pointer;
+      }
+      .tabs button.active {
+        background: var(--primary-color, #03a9f4); color: var(--text-primary-color, #fff);
+      }
       svg { display: block; width: 100%; height: auto; touch-action: none; }
       .grid line { stroke: var(--divider-color, #e0e0e0); stroke-width: 1; }
       .axis text { fill: var(--secondary-text-color, #888); font-size: 10px; }
@@ -129,6 +148,10 @@ class HeatCurveCard extends HTMLElement {
       card.appendChild(t);
     }
 
+    if (this._config.tabs && this._config.tabs.length) {
+      this._buildTabs(card);
+    }
+
     const svg = svgEl("svg", { viewBox: `0 0 ${width} ${height}` });
     this._svg = svg;
     card.appendChild(svg);
@@ -136,6 +159,7 @@ class HeatCurveCard extends HTMLElement {
 
     this._drawStatic(svg);
     this._drawLines(svg);
+    this._applyTabVisibility();
 
     svg.addEventListener("pointermove", (e) => this._onPointerMove(e));
     svg.addEventListener("pointerup", (e) => this._onPointerUp(e));
@@ -172,13 +196,16 @@ class HeatCurveCard extends HTMLElement {
     });
     svg.appendChild(axis);
 
+    this._legendEls = {};
     const legend = svgEl("g", { class: "legend" });
-    this._config.lines.forEach((line, i) => {
-      const ly = r.y + i * 14;
-      legend.appendChild(svgEl("circle", { cx: r.x + r.w + 6, cy: ly, r: 3, fill: line.color }));
-      const t = svgEl("text", { x: r.x + r.w + 12, y: ly + 3 });
+    this._config.lines.forEach((line) => {
+      const g = svgEl("g", {});
+      g.appendChild(svgEl("circle", { cx: r.x + r.w + 6, r: 3, fill: line.color }));
+      const t = svgEl("text", { x: r.x + r.w + 12 });
       t.textContent = line.label || line.id;
-      legend.appendChild(t);
+      g.appendChild(t);
+      legend.appendChild(g);
+      this._legendEls[line.id] = g;
     });
     // legend sits outside the main plot width, so widen the viewBox to fit it
     svg.setAttribute("viewBox", `0 0 ${this._config.width + 60} ${this._config.height}`);
@@ -186,23 +213,71 @@ class HeatCurveCard extends HTMLElement {
   }
 
   _drawLines(svg) {
+    this._lineGroups = {};
     this._pathEls = {};
     this._pointEls = {};
     this._config.lines.forEach((line) => {
+      const g = svgEl("g", { "data-line-id": line.id });
+      svg.appendChild(g);
+      this._lineGroups[line.id] = g;
+
       const path = svgEl("polyline", { fill: "none", stroke: line.color, "stroke-width": 2 });
-      svg.appendChild(path);
+      g.appendChild(path);
       this._pathEls[line.id] = path;
       this._pointEls[line.id] = {};
       this._config.hours.forEach((hour) => {
         const entityId = this._entityId(line, hour);
-        const c = svgEl("circle", { r: 6, fill: line.color, class: "pt" });
+        const c = svgEl("circle", { r: POINT_RADIUS, fill: line.color, class: "pt" });
         c.dataset.lineId = line.id;
         c.dataset.hour = hour;
         c.dataset.entityId = entityId;
         c.addEventListener("pointerdown", (e) => this._onPointerDown(e, line, hour, entityId));
-        svg.appendChild(c);
+        g.appendChild(c);
         this._pointEls[line.id][hour] = c;
       });
+    });
+  }
+
+  // ---- tabs ----
+
+  _buildTabs(card) {
+    const wrap = document.createElement("div");
+    wrap.className = "tabs";
+    this._config.tabs.forEach((tab, i) => {
+      const btn = document.createElement("button");
+      btn.textContent = tab.label;
+      if (i === this._activeTab) btn.classList.add("active");
+      btn.addEventListener("click", () => {
+        this._activeTab = i;
+        wrap.querySelectorAll("button").forEach((b, bi) => b.classList.toggle("active", bi === i));
+        this._applyTabVisibility();
+      });
+      wrap.appendChild(btn);
+    });
+    card.appendChild(wrap);
+  }
+
+  _visibleLineIds() {
+    const tabs = this._config.tabs;
+    if (!tabs || !tabs.length) return this._config.lines.map((l) => l.id);
+    return tabs[this._activeTab].lines;
+  }
+
+  _applyTabVisibility() {
+    const visible = new Set(this._visibleLineIds());
+    let legendIndex = 0;
+    const r = this._plotRect();
+    this._config.lines.forEach((line) => {
+      const shown = visible.has(line.id);
+      this._lineGroups[line.id].style.display = shown ? "" : "none";
+      const legendEl = this._legendEls[line.id];
+      legendEl.style.display = shown ? "" : "none";
+      if (shown) {
+        const ly = r.y + legendIndex * 14;
+        legendEl.querySelector("circle").setAttribute("cy", ly);
+        legendEl.querySelector("text").setAttribute("y", ly + 3);
+        legendIndex += 1;
+      }
     });
   }
 
