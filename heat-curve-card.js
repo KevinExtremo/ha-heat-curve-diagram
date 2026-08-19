@@ -53,7 +53,7 @@ class HeatCurveCard extends HTMLElement {
       y_range: [16, 26],
       step: 0.5,
       width: 500,
-      height: 260,
+      height: 420,
       ...config,
     };
     this._dragging = null; // { lineId, hour, entityId, pointerId }
@@ -77,7 +77,7 @@ class HeatCurveCard extends HTMLElement {
   // ---- layout helpers ----
 
   _padding() {
-    return { top: 16, right: 16, bottom: 28, left: 34 };
+    return { top: 16, right: 16, bottom: 28, left: 40 };
   }
 
   _plotRect() {
@@ -133,10 +133,13 @@ class HeatCurveCard extends HTMLElement {
       }
       svg { display: block; width: 100%; height: auto; touch-action: none; }
       .grid line { stroke: var(--divider-color, #e0e0e0); stroke-width: 1; }
-      .axis text { fill: var(--secondary-text-color, #888); font-size: 10px; }
+      .grid line.major { stroke: var(--secondary-text-color, #bbb); }
+      .axis text { fill: var(--secondary-text-color, #888); font-size: 9px; }
+      .axis text.major { font-size: 10px; font-weight: 600; }
       .pt { cursor: grab; }
       .pt:active { cursor: grabbing; }
       .legend text { fill: var(--primary-text-color, #333); font-size: 11px; }
+      .drag-tooltip text { fill: #fff; font-size: 12px; font-weight: 600; }
     `;
     shadow.appendChild(style);
 
@@ -159,6 +162,7 @@ class HeatCurveCard extends HTMLElement {
 
     this._drawStatic(svg);
     this._drawLines(svg);
+    this._buildDragTooltip(svg);
     this._applyTabVisibility();
 
     svg.addEventListener("pointermove", (e) => this._onPointerMove(e));
@@ -173,19 +177,28 @@ class HeatCurveCard extends HTMLElement {
     const [ymin, ymax] = this._config.y_range;
     const hours = this._config.hours;
 
+    // gridlines/labels at every `step` (0.5 by default) — matches the actual editing
+    // granularity, so a dragged point always lines up visually with a labeled line. Whole
+    // degrees get a slightly bolder line + label to stay readable among the half-degree ones.
+    const gridStep = this._config.step;
+    const stepCount = Math.round((ymax - ymin) / gridStep);
+
     const grid = svgEl("g", { class: "grid" });
-    // horizontal gridlines every 2 degrees
-    for (let v = Math.ceil(ymin / 2) * 2; v <= ymax; v += 2) {
+    for (let i = 0; i <= stepCount; i++) {
+      const v = Math.round((ymin + i * gridStep) * 100) / 100;
       const y = this._yScale(v);
-      grid.appendChild(svgEl("line", { x1: r.x, x2: r.x + r.w, y1: y, y2: y }));
+      const major = Number.isInteger(v);
+      grid.appendChild(svgEl("line", { x1: r.x, x2: r.x + r.w, y1: y, y2: y, class: major ? "major" : "" }));
     }
     svg.appendChild(grid);
 
     const axis = svgEl("g", { class: "axis" });
-    for (let v = Math.ceil(ymin / 2) * 2; v <= ymax; v += 2) {
+    for (let i = 0; i <= stepCount; i++) {
+      const v = Math.round((ymin + i * gridStep) * 100) / 100;
       const y = this._yScale(v);
-      const t = svgEl("text", { x: r.x - 6, y: y + 3, "text-anchor": "end" });
-      t.textContent = v;
+      const major = Number.isInteger(v);
+      const t = svgEl("text", { x: r.x - 6, y: y + 3, "text-anchor": "end", class: major ? "major" : "" });
+      t.textContent = major ? v : v.toFixed(1);
       axis.appendChild(t);
     }
     hours.forEach((h) => {
@@ -236,6 +249,35 @@ class HeatCurveCard extends HTMLElement {
         this._pointEls[line.id][hour] = c;
       });
     });
+  }
+
+  // ---- drag value tooltip ----
+
+  _buildDragTooltip(svg) {
+    const g = svgEl("g", { class: "drag-tooltip" });
+    g.style.display = "none";
+    const rect = svgEl("rect", { rx: 4, ry: 4, width: 42, height: 20, fill: "var(--primary-color, #03a9f4)" });
+    const text = svgEl("text", { x: 21, "text-anchor": "middle", y: 14 });
+    g.appendChild(rect);
+    g.appendChild(text);
+    svg.appendChild(g);
+    this._dragTooltip = { g, rect, text };
+  }
+
+  _showDragTooltip(hour, value) {
+    const tt = this._dragTooltip;
+    const px = this._xScale(hour);
+    const py = this._yScale(value);
+    tt.rect.setAttribute("x", px - 21);
+    tt.rect.setAttribute("y", py - 34);
+    tt.text.setAttribute("x", px);
+    tt.text.setAttribute("y", py - 20);
+    tt.text.textContent = `${value.toFixed(1)}°`;
+    tt.g.style.display = "";
+  }
+
+  _hideDragTooltip() {
+    this._dragTooltip.g.style.display = "none";
   }
 
   // ---- tabs ----
@@ -325,6 +367,7 @@ class HeatCurveCard extends HTMLElement {
       entMax: st && st.attributes.max !== undefined ? st.attributes.max : this._config.y_range[1],
     };
     this._localValues[entityId] = parseFloat(st.state);
+    this._showDragTooltip(hour, this._localValues[entityId]);
   }
 
   _pairedValue(line, hour) {
@@ -357,6 +400,7 @@ class HeatCurveCard extends HTMLElement {
 
     this._localValues[d.entityId] = value;
     this._syncFromHass();
+    this._showDragTooltip(d.hour, value);
     this._maybeSend(d.entityId, value);
   }
 
@@ -365,6 +409,7 @@ class HeatCurveCard extends HTMLElement {
     if (!d || e.pointerId !== d.pointerId) return;
     const value = this._localValues[d.entityId];
     this._sendNow(d.entityId, value);
+    this._hideDragTooltip();
     this._dragging = null;
     // keep the local value pinned until hass state actually reflects it, to avoid a visual
     // snap-back while waiting for the round trip
