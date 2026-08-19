@@ -131,7 +131,11 @@ class HeatCurveCard extends HTMLElement {
       .tabs button.active {
         background: var(--primary-color, #03a9f4); color: var(--text-primary-color, #fff);
       }
-      svg { display: block; width: 100%; height: auto; touch-action: none; }
+      /* pan-y (not none): lets a touch that starts on empty chart background still scroll the
+         page vertically. A touch that starts on a point (.pt) calls preventDefault() on its own
+         pointerdown, which overrides this and suppresses the scroll for that gesture -- so
+         dragging a point still works, it's only the rest of the chart that stays scrollable. */
+      svg { display: block; width: 100%; height: auto; touch-action: pan-y; }
       .grid line { stroke: var(--divider-color, #e0e0e0); stroke-width: 1; }
       .grid line.major { stroke: var(--secondary-text-color, #bbb); }
       .axis text { fill: var(--secondary-text-color, #888); font-size: 9px; }
